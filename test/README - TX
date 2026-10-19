@@ -1,0 +1,34 @@
+Dale, vamos pin por pin del datasheet del TRW24HP (que son los mismos 7 pines del nRF24L01+, ya que el TRW24HP es básicamente ese chip + amplificador externo) y qué le hace exactamente el código a cada uno.
+
+## Los 7 pines del módulo
+
+**VCC y GND** — El código no los toca para nada. Van a tu fuente externa de 5V y su GND, unido al GND del ESP32. Ningún GPIO del ESP32 interviene acá.
+
+**CE1 (D4 GPIO4) y CE2 (D32 GPIO32) — "Chip Enable"**
+Es el pin que le dice al chip "estás habilitado para transmitir/recibir ahora". El código lo maneja indirectamente, nunca escribís `digitalWrite(CE...)` vos mismo — es la librería RF24 la que lo hace dentro de:
+- `radio.stopConstCarrier()` → baja CE (deshabilita) para dejar el chip en estado limpio antes de reconfigurar.
+- `radio.startConstCarrier(PA_LEVEL, channel)` → sube CE y lo deja en alto de forma sostenida, porque a diferencia de una transmisión normal (donde CE se pulsa brevemente por paquete), en modo CW el chip necesita CE en alto **todo el tiempo** que quieras portadora activa. Por eso es "continua".
+
+**CSN1 (GPIO15) y CSN2 (GPIO21) — "Chip Select Not"**
+Es el selector del bus SPI: en bajo, el chip escucha comandos; en alto, lo ignora. La librería lo baja automáticamente cada vez que necesita mandar un comando SPI (por ejemplo al escribir un registro) y lo vuelve a subir al terminar. Vos nunca lo tocás directo; en tu código aparece solo como el segundo parámetro del constructor: `RF24 radio1(CE1_PIN, CSN1_PIN)`.
+
+**SCK1/SCK2 (GPIO14 / GPIO18) — Reloj SPI**
+Lo generan `hspi.begin(...)` y `vspi.begin(...)` al inicializar cada bus. Cada pulso de reloj sincroniza un bit de datos en MOSI/MISO. Vos no interactuás con esto directamente, solo lo declarás una vez en `setup()`.
+
+**MOSI1/MOSI2 (GPIO13 / GPIO23) — Master Out Slave In**
+Por acá el ESP32 le manda los comandos al chip: "escribí este registro", "activá CONT_WAVE", "cambiá de canal", etc. Toda esa comunicación ocurre dentro de las funciones de la librería (`setChannel()`, `startConstCarrier()`, `setPALevel()`...); vos no armás los bytes a mano, la librería los arma y los tira por este pin.
+
+**MISO1/MISO2 (GPIO12 / GPIO19) — Master In Slave Out**
+Es la vía inversa: el chip le contesta al ESP32. Se usa, por ejemplo, en `radio1.isChipConnected()` — ahí el ESP32 le pide al chip que le devuelva el contenido de un registro interno por este pin, y si la respuesta tiene sentido, confirma que hay hardware real conectado.
+
+**IRQ — no se usa**
+Tu tabla lo deja sin conectar y el código tampoco lo referencia en ningún lado. Es opcional: se usa normalmente para que el chip le avise al micro por interrupción cuando terminó de transmitir/recibir, pero como estás en modo CW (no mandás paquetes, solo portadora pura), no tiene sentido usarlo — por eso ni aparece como macro.
+
+## Cómo se conecta todo esto con la lógica del programa
+
+1. **`setup()`** arranca los dos buses SPI (`hspi.begin()`, `vspi.begin()`), que activa SCK/MOSI/MISO/CSN de cada lado.
+2. **`configurarModuloCW()`** manda, vía SPI (o sea usando SCK+MOSI+MISO+CSN), los comandos para: desactivar auto-ACK, poner el chip en modo TX, fijar potencia y velocidad de aire. Ninguno de estos pasos toca CE todavía.
+3. Según el modo (`MODE_FIXED_CHANNEL` o `MODE_SWEEP`), se llama a `startConstCarrier()`, que es el único momento donde **CE pasa a alto y se queda ahí** — ahí es literalmente cuando empieza a salir señal de RF por la antena.
+4. Si estás en modo sweep, el **timer por hardware** (no usa ningún pin físico, es interno al chip ESP32) dispara la ISR cada `SWEEP_INTERVAL_US`, que solo levanta una bandera. En `loop()`, cuando ve la bandera en `true`, llama a `actualizarCanalAmbosModulos()`, que hace `stopConstCarrier()` (CE a bajo, corta la portadora un instante) → `setChannel()` (manda por SPI el nuevo canal) → `startConstCarrier()` (CE a alto de nuevo, ya en el nuevo canal).
+
+Así que en resumen: **CE es el único pin que literalmente "prende y apaga" la señal de RF**, y **CSN+SCK+MOSI+MISO son el canal de configuración** por donde el ESP32 le dice al chip qué hacer antes de prenderlo.

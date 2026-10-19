@@ -1,0 +1,68 @@
+
+Dale, vamos parte por parte. Primero los pines del módulo según el datasheet del nRF24L01+ (el chip que lleva el TRW24HP), y después cómo cada uno de esos pines se usa en el código del logger de espectro.
+
+## 1) Los pines del nRF24L01+ según el datasheet
+
+El chip se comunica con el microcontrolador por **SPI** (Serial Peripheral Interface), un bus donde un "maestro" (el ESP32) controla a uno o varios "esclavos" (los módulos RF). Por eso la mayoría de los pines son de ese bus:
+
+| Pin | Función según datasheet |
+|---|---|
+| **VCC** | Alimentación del chip. El nRF24L01+ trabaja a 3.3V (no tolera 5V directo en el chip, pero el TRW24HP al ser un módulo de mayor potencia trae su propio regulador, por eso a él sí le das 5V desde tu fuente externa). |
+| **GND** | Tierra. Tiene que ser común con la del ESP32 para que las señales digitales tengan una referencia compartida. |
+| **CE** (Chip Enable) | Es el pin que le dice al chip "activate la radio". No es parte del SPI — es una línea digital simple aparte. En bajo, el chip está en standby (SPI sigue funcionando para configurarlo, pero la radio no transmite ni escucha). En alto, según cómo esté configurado el registro `CONFIG`, entra en modo RX (escuchando) o TX (transmitiendo). |
+| **CSN** (Chip Select Not) | Es el "Chip Select" del bus SPI, activo en bajo (por eso el "N" de negado). Cuando el ESP32 pone este pin en bajo, le dice al chip "prestame atención, lo que mande por MOSI es para vos". Es lo que permite tener varios dispositivos SPI en el mismo bus: cada uno tiene su propio CSN, y solo "escucha" el que tiene el CSN en bajo. |
+| **SCK** (Serial Clock) | El reloj del bus SPI, generado por el maestro (ESP32). Cada pulso de reloj mueve un bit de datos. |
+| **MOSI** (Master Out, Slave In) | Línea de datos que va del ESP32 *hacia* el módulo RF: comandos, configuración de registros, datos a transmitir. |
+| **MISO** (Master In, Slave Out) | Línea de datos que va del módulo RF *hacia* el ESP32: estado del chip, registros leídos, datos recibidos. |
+| **IRQ** (Interrupt) | Salida digital que el chip pone en bajo cuando ocurre un evento (paquete recibido, paquete enviado, error de reintentos). Es opcional: podés no conectarlo y en su lugar consultar el estado por SPI, que es justamente lo que hace la librería RF24 y lo que hace tu código (por eso en tu tabla de pines IRQ queda vacío).
+
+## 2) Qué hace el código con cada uno de estos pines
+
+### CE y CSN — por qué van como parámetros del objeto `RF24`
+
+```cpp
+RF24 radio1(CE1_PIN, CSN1_PIN);
+RF24 radio2(CE2_PIN, CSN2_PIN);
+```
+
+Estos dos son los únicos pines que la librería maneja "a mano", con `digitalWrite()`, porque no son parte del protocolo SPI estándar (SPI en sí solo define SCK/MOSI/MISO/CS). Por eso se los pasa aparte al constructor.
+
+- **CSN1_PIN=15 / CSN2_PIN=21**: la librería los usa para seleccionar cada chip antes de cada transacción SPI (por ejemplo, antes de leer o escribir un registro).
+- **CE1_PIN=16 / CE2_PIN=22**: la librería los sube o baja según el modo. Con `startListening()`, además de configurar el registro `CONFIG` para modo RX, pone **CE en alto**, que es lo que efectivamente activa el receptor de RF. Mientras CE esté en alto y el chip esté en modo RX, el radio está físicamente escuchando el aire en el canal configurado.
+
+### SCK / MOSI / MISO — por qué van con `SPIClass` en vez de directo
+
+```cpp
+SPIClass hspi(HSPI);
+SPIClass vspi(VSPI);
+...
+hspi.begin(SCK1_PIN, MISO1_PIN, MOSI1_PIN, CSN1_PIN);
+vspi.begin(SCK2_PIN, MISO2_PIN, MOSI2_PIN, CSN2_PIN);
+
+radio1.begin(&hspi);
+radio2.begin(&vspi);
+```
+
+El ESP32 tiene **dos controladores SPI de hardware independientes** (HSPI y VSPI), cada uno puede tener su propio set de pines SCK/MOSI/MISO. Por eso en tu distribución cada módulo tiene su propio SCK/MOSI/MISO, en vez de compartir un solo bus. `SPIClass::begin()` es lo que le dice al ESP32 "en estos pines específicos va a correr este controlador SPI". Después, pasarle `&hspi` o `&vspi` a `radio.begin()` es lo que le dice a la librería RF24 "usá este controlador y no el bus SPI por defecto" — así cada radio queda aislado en su propio bus físico, sin competir por las mismas líneas.
+
+### CSN dentro de `begin()` — un detalle sutil
+
+Fijate que `CSN1_PIN` aparece dos veces: en el constructor `RF24(CE1_PIN, CSN1_PIN)` y también como cuarto argumento de `hspi.begin(SCK1_PIN, MISO1_PIN, MOSI1_PIN, CSN1_PIN)`. Esto es porque el ESP32 Arduino core lo pide para reservar internamente ese pin como parte del periférico SPI, pero el que efectivamente lo maneja bit a bit en cada transacción es la librería RF24 (con `digitalWrite`), no el hardware SPI automático. Es una particularidad del core de ESP32, no algo específico del chip nRF24.
+
+### IRQ — por qué no está conectado ni usado
+
+Tu tabla de pines no lo usa, y el código tampoco lo necesita: en vez de esperar una interrupción de hardware cuando llega un paquete, el código **consulta directamente el registro RPD por SPI** con `radio.testRPD()`. Es un enfoque distinto: en lugar de reaccionar a un evento, vas preguntando activamente "¿hay señal ahora?" en cada canal.
+
+### VCC / GND — por qué no aparecen en el código
+
+Son puramente eléctricos, no tienen ninguna línea de software asociada. El único rol que juegan en el diseño es que, como mencionaste, el TRW24HP toma 5V de tu fuente externa (su propio regulador baja eso a los 3.3V que necesita el chip nRF24L01+ internamente), y que el GND tiene que estar unido al GND del ESP32 para que las señales digitales (CE, CSN, SCK, MOSI, MISO) tengan una referencia de voltaje común — sin esto, aunque todo el cableado de señal esté bien, la comunicación SPI no funciona.
+
+### Ahora la lógica del programa, apoyada en todo esto
+
+1. **`configurarModuloEscucha()`**: llama `radio.begin()` (inicializa el chip por SPI, resetea registros a default), desactiva el auto-acknowledge (`setAutoAck(false)` — no queremos que el chip intente responder paquetes, solo medir energía), fija la velocidad de datos, y por último `startListening()`, que es el paso que **sube CE** y pone el chip en modo RX real.
+
+2. **`medirActividad()`**: cambia el canal (`setChannel()`, que internamente escribe el registro `RF_CH` — cada unidad equivale a 1MHz de separación desde 2.400GHz), espera los ~170µs que pide el datasheet para que la lectura de RPD sea válida, y lee `testRPD()`, que por SPI consulta el registro `RPD` (dirección 0x09) — el bit que indica si la potencia recibida en ese instante superó el umbral (~-64dBm).
+
+3. **El timer/ISR**: en vez de leer canales todo el tiempo a máxima velocidad, un timer de hardware del ESP32 genera una interrupción cada `SCAN_INTERVAL_US`. La ISR solo prende una bandera (`channelStepFlag`) — a propósito no hace nada de SPI ahí adentro, porque las transacciones SPI son relativamente lentas y no es seguro hacerlas dentro de una interrupción. El `loop()` revisa esa bandera y, si está prendida, recién ahí avanza de canal y hace las lecturas reales.
+
+¿Querés que hagamos el mismo repaso pero para el código de portadora continua (CW), explicando qué hace `startConstCarrier()` a nivel de registros del chip?
