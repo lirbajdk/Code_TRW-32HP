@@ -1,0 +1,259 @@
+/*
+  ============================================================================
+   DIAGNOSTICO de conexión - 2x TRW24HP en ESP32 (sin librería RF24)
+  ============================================================================
+   NO emite RF. Lee registros del chip por SPI "a mano" y permite probar
+   cada pin con el tester. Se maneja por el Monitor Serie (115200).
+
+   Comandos (enviar una letra):
+     h  -> ENABLE de ambos módulos en ALTO
+     l  -> ENABLE de ambos módulos en BAJO
+     z  -> ENABLE en alta impedancia (flotante)
+     r  -> leer registros ahora (también se leen solos cada 2 s)
+     m  -> probar si cada módulo maneja su línea MISO
+     p  -> recorrer pines: cada pin de salida pasa a ALTO 5 s, de a uno,
+           para medir con el tester en el pin correspondiente del módulo
+     ?  -> mostrar esta ayuda
+
+   Cómo leer los registros:
+   - Cualquier valor que NO sea 0x00 ni 0xFF significa que el módulo
+     contesta por SPI.
+   - Todo 0x00: MISO clavada en bajo (módulo sin energía, ENABLE incorrecto
+     o MISO en corto a GND).
+   - Todo 0xFF: MISO flotando o en alto (módulo no conectado/no contesta).
+   - Valores de fábrica esperados: CONFIG 0x08, RF_CH 0x02,
+     RF_SETUP 0x0E (o 0x0F), STATUS 0x0E. Si ya corriste el programa
+     principal con el módulo energizado, pueden ser otros valores válidos.
+  ============================================================================
+*/
+
+#include <Arduino.h>
+#include <SPI.h>
+
+// ---- Pines (mismos que main.cpp, según el esquema) ----
+#define EN1_PIN 4
+#define CE1_PIN 23
+#define CSN1_PIN 22
+#define SCK1_PIN 21
+#define MOSI1_PIN 19
+#define MISO1_PIN 18
+
+#define EN2_PIN 32
+#define CE2_PIN 25
+#define CSN2_PIN 26
+#define SCK2_PIN 14
+#define MOSI2_PIN 12
+#define MISO2_PIN 13
+
+SPIClass vspi(VSPI);
+SPIClass hspi(HSPI);
+
+struct Modulo
+{
+    const char *nombre;
+    uint8_t en, ce, csn, sck, mosi, miso;
+    SPIClass *spi;
+};
+
+Modulo mods[2] = {
+    {"Modulo 1", EN1_PIN, CE1_PIN, CSN1_PIN, SCK1_PIN, MOSI1_PIN, MISO1_PIN, &vspi},
+    {"Modulo 2", EN2_PIN, CE2_PIN, CSN2_PIN, SCK2_PIN, MOSI2_PIN, MISO2_PIN, &hspi}};
+
+int estadoEnable = 1; // 1 = alto, 0 = bajo, -1 = flotante
+
+// ------------------------------------------------------------
+void aplicarEnable()
+{
+    for (auto &m : mods)
+    {
+        if (estadoEnable < 0)
+        {
+            pinMode(m.en, INPUT);
+        }
+        else
+        {
+            pinMode(m.en, OUTPUT);
+            digitalWrite(m.en, estadoEnable ? HIGH : LOW);
+        }
+    }
+}
+
+void iniciarSPI()
+{
+    for (auto &m : mods)
+    {
+        pinMode(m.csn, OUTPUT);
+        digitalWrite(m.csn, HIGH);
+        pinMode(m.ce, OUTPUT);
+        digitalWrite(m.ce, LOW);
+    }
+    vspi.begin(SCK1_PIN, MISO1_PIN, MOSI1_PIN, CSN1_PIN);
+    hspi.begin(SCK2_PIN, MISO2_PIN, MOSI2_PIN, CSN2_PIN);
+}
+
+void detenerSPI()
+{
+    vspi.end();
+    hspi.end();
+}
+
+// Lee un registro (R_REGISTER). Devuelve el valor y deja STATUS en 'status'
+uint8_t leerReg(Modulo &m, uint8_t reg, uint8_t &status)
+{
+    m.spi->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(m.csn, LOW);
+    delayMicroseconds(5);
+    status = m.spi->transfer(reg & 0x1F);
+    uint8_t v = m.spi->transfer(0xFF);
+    delayMicroseconds(5);
+    digitalWrite(m.csn, HIGH);
+    m.spi->endTransaction();
+    return v;
+}
+
+void leerRegistros()
+{
+    Serial.println("---- Lectura de registros ----");
+    for (auto &m : mods)
+    {
+        uint8_t st, cfg, ch, rfs, stat;
+        cfg = leerReg(m, 0x00, st);
+        ch = leerReg(m, 0x05, st);
+        rfs = leerReg(m, 0x06, st);
+        stat = leerReg(m, 0x07, st);
+        Serial.printf("%s | CONFIG=0x%02X  RF_CH=0x%02X  RF_SETUP=0x%02X  STATUS=0x%02X",
+                      m.nombre, cfg, ch, rfs, stat);
+        if (cfg == 0x00 && ch == 0x00 && rfs == 0x00 && stat == 0x00)
+        {
+            Serial.println("  -> TODO 0x00: MISO en bajo / sin energia / ENABLE");
+        }
+        else if (cfg == 0xFF && ch == 0xFF && rfs == 0xFF && stat == 0xFF)
+        {
+            Serial.println("  -> TODO 0xFF: MISO flotando, el modulo no contesta");
+        }
+        else
+        {
+            Serial.println("  -> CONTESTA por SPI");
+        }
+    }
+}
+
+// Con CSN en bajo, un nRF24 vivo maneja MISO (bit 7 de STATUS = 0).
+// Con pull-up interno: lee 0 -> el módulo la maneja; lee 1 -> nadie la maneja.
+void probarMISO()
+{
+    Serial.println("---- Prueba de MISO ----");
+    detenerSPI();
+    for (auto &m : mods)
+    {
+        pinMode(m.csn, OUTPUT);
+        digitalWrite(m.csn, LOW);
+        pinMode(m.miso, INPUT_PULLUP);
+        delay(10);
+        int v = digitalRead(m.miso);
+        digitalWrite(m.csn, HIGH);
+        Serial.printf("%s MISO (GPIO%u): lee %d -> %s\n", m.nombre, m.miso, v,
+                      v == 0 ? "el modulo la MANEJA (esta vivo)"
+                             : "NADIE la maneja (modulo sin energia/ENABLE/pin mal)");
+    }
+    iniciarSPI();
+}
+
+// Pone cada pin de salida en ALTO 5 s, de a uno, para medir con tester
+void recorrerPines()
+{
+    struct Salida
+    {
+        const char *n;
+        uint8_t p;
+    };
+    const Salida salidas[] = {
+        {"M1 ENABLE", EN1_PIN}, {"M1 CE", CE1_PIN}, {"M1 CSN", CSN1_PIN}, {"M1 SCK", SCK1_PIN}, {"M1 MOSI", MOSI1_PIN}, {"M2 ENABLE", EN2_PIN}, {"M2 CE", CE2_PIN}, {"M2 CSN", CSN2_PIN}, {"M2 SCK", SCK2_PIN}, {"M2 MOSI", MOSI2_PIN}};
+
+    detenerSPI();
+    for (auto &s : salidas)
+    {
+        pinMode(s.p, OUTPUT);
+        digitalWrite(s.p, LOW);
+    }
+
+    Serial.println("---- Recorrido de pines (medir con tester contra GND) ----");
+    for (auto &s : salidas)
+    {
+        Serial.printf("%s (GPIO%u) en ALTO 5 s -> en el pin del modulo deberias medir ~3.3 V\n",
+                      s.n, s.p);
+        digitalWrite(s.p, HIGH);
+        delay(5000);
+        digitalWrite(s.p, LOW);
+    }
+    Serial.println("Recorrido terminado.");
+    aplicarEnable();
+    iniciarSPI();
+}
+
+void ayuda()
+{
+    Serial.println("Comandos: h=ENABLE alto | l=ENABLE bajo | z=ENABLE flotante | r=leer registros | m=probar MISO | p=recorrer pines | ?=ayuda");
+}
+
+// ------------------------------------------------------------
+void setup()
+{
+    Serial.begin(115200);
+    delay(300);
+    Serial.println("=== DIAGNOSTICO TRW24HP x2 (no emite RF) ===");
+    aplicarEnable();
+    delay(100);
+    iniciarSPI();
+    ayuda();
+}
+
+void loop()
+{
+    while (Serial.available())
+    {
+        char c = Serial.read();
+        switch (c)
+        {
+        case 'h':
+            estadoEnable = 1;
+            aplicarEnable();
+            Serial.println("ENABLE = ALTO");
+            delay(100);
+            break;
+        case 'l':
+            estadoEnable = 0;
+            aplicarEnable();
+            Serial.println("ENABLE = BAJO");
+            delay(100);
+            break;
+        case 'z':
+            estadoEnable = -1;
+            aplicarEnable();
+            Serial.println("ENABLE = FLOTANTE");
+            delay(100);
+            break;
+        case 'r':
+            leerRegistros();
+            break;
+        case 'm':
+            probarMISO();
+            break;
+        case 'p':
+            recorrerPines();
+            break;
+        case '?':
+            ayuda();
+            break;
+        default:
+            break;
+        }
+    }
+
+    static uint32_t t = 0;
+    if (millis() - t > 2000)
+    {
+        t = millis();
+        leerRegistros();
+    }
+}
