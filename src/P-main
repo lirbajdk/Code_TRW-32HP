@@ -1,0 +1,590 @@
+//------------------------------------------------------------------------------------------------//
+//-------------------------- ------------------------//
+//------------------------------------------------------------------------------------------------//
+
+
+//------------------------------------------------------------------------------------------------//
+//-------------------------SEPTIMO MODELO PARA TRANSMITIR RUIDO LOS MODULOS-----------------------//
+//------------------------------------------------------------------------------------------------//
+
+#include <SPI.h>
+#include <RF24.h>
+
+// --- Configuración Módulo 1 ---
+#define MOD1_CE     23
+#define MOD1_CSN    22
+#define MOD1_SCK    21
+#define MOD1_MOSI   19
+#define MOD1_MISO   18
+#define MOD1_ENABLE 4
+
+// --- Configuración Módulo 2 ---
+#define MOD2_CE     25
+#define MOD2_CSN    26
+#define MOD2_SCK    14
+#define MOD2_MOSI   12
+#define MOD2_MISO   13
+#define MOD2_ENABLE 32
+
+SPIClass hspi(HSPI);
+SPIClass vspi(VSPI);
+
+RF24 radio1(MOD1_CE, MOD1_CSN);
+RF24 radio2(MOD2_CE, MOD2_CSN);
+
+// Paquete de datos basura de 32 bytes (el máximo permitido por el nRF24)
+byte datosBasura[32];
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+
+  Serial.println("\n--- Iniciando Modo de Saturación RF Agresiva ---");
+
+  pinMode(MOD1_ENABLE, OUTPUT);
+  pinMode(MOD2_ENABLE, OUTPUT);
+  digitalWrite(MOD1_ENABLE, HIGH);
+  digitalWrite(MOD2_ENABLE, HIGH);
+  delay(150);
+
+  hspi.begin(MOD1_SCK, MOD1_MISO, MOD1_MOSI, MOD1_CSN);
+  vspi.begin(MOD2_SCK, MOD2_MISO, MOD2_MOSI, MOD2_CSN);
+
+  if (!radio1.begin(&hspi) || !radio2.begin(&vspi)) {
+    Serial.println("Error crítico inicializando radios.");
+    while (1);
+  }
+
+  // Configuración de máxima potencia y máxima agresividad de transmisión
+  radio1.setPALevel(RF24_PA_MAX);
+  radio1.setDataRate(RF24_2MBPS); // 2 Mbps satura más rápido el aire
+  radio1.setAutoAck(false);       // Desactivar ACK para que no pierda tiempo esperando respuestas
+  radio1.stopListening();
+
+  radio2.setPALevel(RF24_PA_MAX);
+  radio2.setDataRate(RF24_2MBPS);
+  radio2.setAutoAck(false);
+  radio2.stopListening();
+
+  // Rellenar el buffer con datos aleatorios
+  for (int i = 0; i < 32; i++) {
+    datosBasura[i] = random(0, 255);
+  }
+}
+
+void loop() {
+  // Elegir canales de forma aleatoria o secuencial muy rápida dentro de la zona Wi-Fi (ej: canales 1 al 13 del nRF equivalen aprox a canales Wi-Fi)
+  uint8_t canal1 = random(0, 80);
+  uint8_t canal2 = random(81, 125);
+
+  radio1.setChannel(canal1);
+  radio2.setChannel(canal2);
+
+  // Inyectar paquetes de forma masiva sin respirar en este canal
+  // Esto genera un "muro de ruido" de datos digitales en esa frecuencia
+  unsigned long inicio = millis();
+  while (millis() - inicio < 50) { // Pasa 50 milisegundos escupiéndo paquetes en estos canales
+    radio1.write(&datosBasura, sizeof(datosBasura), true); // true = no esperar ACK
+    radio2.write(&datosBasura, sizeof(datosBasura), true);
+  }
+}
+
+//------------------------------------------------------------------------------------------------//
+//------------------------QUINTO MODELO PARA TRANSMITIR PORTADORA CONTINUA------------------------//
+//------------------------------------------------------------------------------------------------//
+#include <SPI.h>
+#include <RF24.h>
+
+// --- Configuración Módulo 1 ---
+#define MOD1_CE     23
+#define MOD1_CSN    22
+#define MOD1_SCK    21
+#define MOD1_MOSI   19
+#define MOD1_MISO   18
+#define MOD1_ENABLE 4
+
+// --- Configuración Módulo 2 ---
+#define MOD2_CE     25
+#define MOD2_CSN    26
+#define MOD2_SCK    14
+#define MOD2_MOSI   12
+#define MOD2_MISO   13
+#define MOD2_ENABLE 32
+
+SPIClass hspi(HSPI);
+SPIClass vspi(VSPI);
+
+RF24 radio1(MOD1_CE, MOD1_CSN);
+RF24 radio2(MOD2_CE, MOD2_CSN);
+
+// Temporizador para 1 segundo (1000 milisegundos)
+unsigned long ultimoCambio = 0;
+const unsigned long intervaloCanal = 1000; 
+
+// Canales iniciales de trabajo (El nRF24L01 soporta del canal 0 al 125)
+uint8_t canalMod1 = 10; // Empieza en 2410 MHz
+uint8_t canalMod2 = 70; // Empieza en 2470 MHz
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+
+  Serial.println("\n--- Iniciando Portadora Continua (Salto de 1s) ---");
+
+  // Encender ambos módulos mediante los pines ENABLE
+  pinMode(MOD1_ENABLE, OUTPUT);
+  pinMode(MOD2_ENABLE, OUTPUT);
+  digitalWrite(MOD1_ENABLE, HIGH);
+  digitalWrite(MOD2_ENABLE, HIGH);
+  delay(150);
+
+  // Inicializar buses SPI independientes
+  hspi.begin(MOD1_SCK, MOD1_MISO, MOD1_MOSI, MOD1_CSN);
+  vspi.begin(MOD2_SCK, MOD2_MISO, MOD2_MOSI, MOD2_CSN);
+
+  // Inicializar radios
+  if (!radio1.begin(&hspi) || !radio2.begin(&vspi)) {
+    Serial.println("Error crítico al inicializar los radios.");
+    while (1);
+  }
+
+  // Iniciar la portadora continua en ambos módulos a la potencia máxima (PA_MAX)
+  radio1.startConstCarrier(RF24_PA_MAX, canalMod1);
+  radio2.startConstCarrier(RF24_PA_MAX, canalMod2);
+
+  Serial.println("¡Portadoras continuas activas!");
+  
+  ultimoCambio = millis();
+}
+
+void loop() {
+  unsigned long tiempoActual = millis();
+
+  // Verificar si ya pasó 1 segundo
+  if (tiempoActual - ultimoCambio >= intervaloCanal) {
+    ultimoCambio = tiempoActual;
+
+    // Avanzar de 1 en 1 canal
+    canalMod1++;
+    if (canalMod1 > 125) canalMod1 = 0; // El límite superior del nRF24 es el canal 125
+
+    canalMod2++;
+    if (canalMod2 > 125) canalMod2 = 0;
+
+    // Aplicar los nuevos canales manteniendo la portadora continua
+    radio1.startConstCarrier(RF24_PA_MAX, canalMod1);
+    radio2.startConstCarrier(RF24_PA_MAX, canalMod2);
+
+    // Imprimir estado actual
+    Serial.print("M1 Canal: "); 
+    Serial.print(canalMod1);
+    Serial.print(" (");
+    Serial.print(2400 + canalMod1);
+    Serial.print(" MHz) | M2 Canal: ");
+    Serial.print(canalMod2);
+    Serial.print(" (");
+    Serial.print(2400 + canalMod2);
+    Serial.println(" MHz)");
+  }
+}
+
+//------------------------------------------------------------------------------------------------//
+//------------------------CUARTO MODELO PARA TRANSMITIR PORTADORA CONTINUA------------------------//
+//------------------------------------------------------------------------------------------------//
+
+#include <SPI.h>
+#include <RF24.h>
+
+// --- Configuración Módulo 1 ---
+#define MOD1_CE     23
+#define MOD1_CSN    22
+#define MOD1_SCK    21
+#define MOD1_MOSI   19
+#define MOD1_MISO   18
+#define MOD1_ENABLE 4
+
+// --- Configuración Módulo 2 ---
+#define MOD2_CE     25
+#define MOD2_CSN    26
+#define MOD2_SCK    14
+#define MOD2_MOSI   12
+#define MOD2_MISO   13
+#define MOD2_ENABLE 32
+
+SPIClass hspi(HSPI);
+SPIClass vspi(VSPI);
+
+RF24 radio1(MOD1_CE, MOD1_CSN);
+RF24 radio2(MOD2_CE, MOD2_CSN);
+
+// Temporizador para los 60 segundos (60000 milisegundos)
+unsigned long ultimoCambio = 0;
+const unsigned long intervaloCanal = 60000; 
+
+// Canales iniciales de trabajo (El nRF24L01 soporta del canal 0 al 125, equivalentes a 2.400 GHz a 2.525 GHz)
+uint8_t canalMod1 = 10; // Empieza en 2410 MHz
+uint8_t canalMod2 = 70; // Empieza en 2470 MHz
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+
+  Serial.println("\n--- Iniciando Generador de Portadora Continua ---");
+
+  // Encender ambos módulos mediante los pines ENABLE
+  pinMode(MOD1_ENABLE, OUTPUT);
+  pinMode(MOD2_ENABLE, OUTPUT);
+  digitalWrite(MOD1_ENABLE, HIGH);
+  digitalWrite(MOD2_ENABLE, HIGH);
+  delay(150); // Estabilización para módulos de alta potencia
+
+  // Inicializar buses SPI independientes
+  hspi.begin(MOD1_SCK, MOD1_MISO, MOD1_MOSI, MOD1_CSN);
+  vspi.begin(MOD2_SCK, MOD2_MISO, MOD2_MOSI, MOD2_CSN);
+
+  // Inicializar radios
+  if (!radio1.begin(&hspi) || !radio2.begin(&vspi)) {
+    Serial.println("Error crítico al inicializar los radios.");
+    while (1);
+  }
+
+  // Iniciar la portadora continua en ambos módulos a la potencia máxima (PA_MAX)
+  // startConstCarrier emite una onda portadora sin datos (CW)
+  radio1.startConstCarrier(RF24_PA_MAX, canalMod1);
+  radio2.startConstCarrier(RF24_PA_MAX, canalMod2);
+
+  Serial.println("¡Portadoras continuas activas!");
+  Serial.print("Módulo 1 emitiendo en Canal: "); Serial.println(canalMod1);
+  Serial.print("Módulo 2 emitiendo en Canal: "); Serial.println(canalMod2);
+  
+  ultimoCambio = millis();
+}
+
+void loop() {
+  unsigned long tiempoActual = millis();
+
+  // Verificar si ya pasaron 60 segundos
+  if (tiempoActual - ultimoCambio >= intervaloCanal) {
+    ultimoCambio = tiempoActual;
+
+    // Cambiar de canal de forma cíclica (avanzamos 10 canales, con tope de 120)
+    canalMod1 += 10;
+    if (canalMod1 > 120) canalMod1 = 10;
+
+    canalMod2 += 10;
+    if (canalMod2 > 120) canalMod2 = 20;
+
+    // Aplicar los nuevos canales manteniendo la portadora continua
+    radio1.startConstCarrier(RF24_PA_MAX, canalMod1);
+    radio2.startConstCarrier(RF24_PA_MAX, canalMod2);
+
+    Serial.println("\n--- [SALTO DE CANAL - 60s] ---");
+    Serial.print("Módulo 1 -> Nuevo canal: "); Serial.println(canalMod1);
+    Serial.print("Módulo 2 -> Nuevo canal: "); Serial.println(canalMod2);
+  }
+}
+
+//------------------------------------------------------------------------------------------------//
+//---------------------TERCER MODELO PARA TRANSMITIR EN TX DESDE LOS MODULOS.---------------------//
+//------------------------------------------------------------------------------------------------//
+
+#include <SPI.h>
+#include <RF24.h>
+
+// --- Configuración Módulo 1 ---
+#define MOD1_CE     23
+#define MOD1_CSN    22
+#define MOD1_SCK    21
+#define MOD1_MOSI   19
+#define MOD1_MISO   18
+#define MOD1_ENABLE 4
+
+// --- Configuración Módulo 2 ---
+#define MOD2_CE     25
+#define MOD2_CSN    26
+#define MOD2_SCK    14
+#define MOD2_MOSI   12
+#define MOD2_MISO   13
+#define MOD2_ENABLE 32
+
+SPIClass hspi(HSPI);
+SPIClass vspi(VSPI);
+
+RF24 radio1(MOD1_CE, MOD1_CSN);
+RF24 radio2(MOD2_CE, MOD2_CSN);
+
+// Dirección común para un receptor externo, o direcciones separadas
+const byte direccionReceptor[6] = "ExtRx";
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+
+  Serial.println("\n--- Iniciando Transmisores Dobles con Antena ---");
+
+  // Encender ambos módulos
+  pinMode(MOD1_ENABLE, OUTPUT);
+  pinMode(MOD2_ENABLE, OUTPUT);
+  digitalWrite(MOD1_ENABLE, HIGH);
+  digitalWrite(MOD2_ENABLE, HIGH);
+  delay(150); // Tiempo extra de arranque para módulos PA+LNA
+
+  // Inicializar buses SPI
+  hspi.begin(MOD1_SCK, MOD1_MISO, MOD1_MOSI, MOD1_CSN);
+  vspi.begin(MOD2_SCK, MOD2_MISO, MOD2_MOSI, MOD2_CSN);
+
+  if (!radio1.begin(&hspi) || !radio2.begin(&vspi)) {
+    Serial.println("Error al inicializar los radios.");
+    while (1);
+  }
+
+  // Configuración de RF para alta potencia y largo alcance
+  radio1.setChannel(76);
+  radio1.setDataRate(RF24_250KBPS);     // 250kbps da mayor alcance y sensibilidad
+  radio1.setPALevel(RF24_PA_MAX);       // Potencia máxima (¡con antenas puestas!)
+  radio1.openWritingPipe(direccionReceptor);
+  radio1.stopListening();
+
+  radio2.setChannel(80);                // Canal diferente para el módulo 2
+  radio2.setDataRate(RF24_250KBPS);
+  radio2.setPALevel(RF24_PA_MAX);
+  radio2.openWritingPipe(direccionReceptor);
+  radio2.stopListening();
+
+  Serial.println("¡Módulos listos y transmitiendo hacia el exterior!");
+}
+
+void loop() {
+  // Transmitir desde Módulo 1
+  const char msg1[] = "Paquete desde Modulo 1 (Canal 76)";
+  bool ok1 = radio1.write(&msg1, sizeof(msg1));
+  Serial.print("M1 TX: ");
+  Serial.println(ok1 ? "Enviado OK" : "Falló (Sin ACK externo)");
+
+  delay(500);
+
+  // Transmitir desde Módulo 2
+  const char msg2[] = "Paquete desde Modulo 2 (Canal 80)";
+  bool ok2 = radio2.write(&msg2, sizeof(msg2));
+  Serial.print("M2 TX: ");
+  Serial.println(ok2 ? "Enviado OK" : "Falló (Sin ACK externo)");
+
+  delay(1500);
+}
+
+//------------------------------------------------------------------------------------------------//
+//---------------------SEGUNDO MODELO PARA VERIFICAR CONEXIÓN CON LOS MODULOS---------------------//
+//-------------------------------------PINGPONG BIDIRECCIONAL-------------------------------------//
+//------------------------------------------------------------------------------------------------//
+
+#include <SPI.h>
+#include <RF24.h>
+
+// --- Configuración Módulo 1 ---
+#define MOD1_CE     23
+#define MOD1_CSN    22
+#define MOD1_SCK    21
+#define MOD1_MOSI   19
+#define MOD1_MISO   18
+#define MOD1_ENABLE 4
+
+// --- Configuración Módulo 2 ---
+#define MOD2_CE     25
+#define MOD2_CSN    26
+#define MOD2_SCK    14
+#define MOD2_MOSI   12
+#define MOD2_MISO   13
+#define MOD2_ENABLE 32
+
+SPIClass hspi(HSPI);
+SPIClass vspi(VSPI);
+
+RF24 radio1(MOD1_CE, MOD1_CSN);
+RF24 radio2(MOD2_CE, MOD2_CSN);
+
+// Direcciones de las tuberías (pipes) para comunicación entre ambos
+// Usamos dos direcciones de 5 bytes invertidas para hablar de uno a otro
+const byte direccion[6] = "NodeX"; 
+const byte direccion2[6] = "NodeY";
+
+unsigned long ultimaTransmision = 0;
+const long intervalo = 1000; // Enviar un mensaje cada 1 segundo
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+
+  Serial.println("\n--- Iniciando prueba de RF Ping-Pong (M1 <-> M2) ---");
+
+  // Encender ambos módulos mediante los pines ENABLE
+  pinMode(MOD1_ENABLE, OUTPUT);
+  pinMode(MOD2_ENABLE, OUTPUT);
+  digitalWrite(MOD1_ENABLE, HIGH);
+  digitalWrite(MOD2_ENABLE, HIGH);
+  delay(100);
+
+  // Inicializar buses SPI
+  hspi.begin(MOD1_SCK, MOD1_MISO, MOD1_MOSI, MOD1_CSN);
+  vspi.begin(MOD2_SCK, MOD2_MISO, MOD2_MOSI, MOD2_CSN);
+
+  // Inicializar radios
+  if (!radio1.begin(&hspi) || !radio2.begin(&vspi)) {
+    Serial.println("Error crítico inicializando los radios.");
+    while (1);
+  }
+
+  // Configuración de los Canales y Potencia
+  radio1.setChannel(108); // Canal RF (0-125)
+  radio1.setDataRate(RF24_1MBPS);
+  radio1.setPALevel(RF24_PA_MIN); // Nivel bajo para evitar saturar si están muy juntos
+
+  radio2.setChannel(108);
+  radio2.setDataRate(RF24_1MBPS);
+  radio2.setPALevel(RF24_PA_MIN);
+
+  // --- Asignación de Roles ---
+  // Módulo 1 escribe (TX) hacia la dirección 2 y escucha en la dirección 1
+  radio1.openWritingPipe(direccion);
+  radio1.openReadingPipe(1, direccion2);
+  radio1.stopListening(); // Módulo 1 empieza como transmisor
+
+  // Módulo 2 escribe (TX) hacia la dirección 1 y escucha en la dirección 2
+  radio2.openWritingPipe(direccion2);
+  radio2.openReadingPipe(1, direccion);
+  radio2.startListening(); // Módulo 2 empieza como receptor
+
+  Serial.println("¡Sistemas listos! M1 transmitiendo, M2 escuchando...");
+}
+
+void loop() {
+  unsigned long tiempoActual = millis();
+
+  // --- 1. BLOQUE DE TRANSMISIÓN (Módulo 1 envía cada 1 segundo) ---
+  if (tiempoActual - ultimaTransmision >= intervalo) {
+    ultimaTransmision = tiempoActual;
+
+    const char texto[] = "Hola desde M1!";
+    radio1.stopListening(); // Asegurar modo TX
+    
+    Serial.print("M1 -> Enviando mensaje: ");
+    Serial.println(texto);
+
+    // Intentar enviar los datos
+    bool exito = radio1.write(&texto, sizeof(texto));
+
+    if (exito) {
+      Serial.println("M1 -> ¡Mensaje enviado con éxito!");
+    } else {
+      Serial.println("M1 -> Falló el envío (No hubo ACK del receptor)");
+    }
+  }
+
+  // --- 2. BLOQUE DE RECEPCIÓN (Módulo 2 escucha si hay datos) ---
+  radio2.startListening(); // Asegurar modo RX
+  if (radio2.available()) {
+    char mensajeRecibido[32] = "";
+    radio2.read(&mensajeRecibido, sizeof(mensajeRecibido));
+    
+    Serial.print("\n>>> M2 RECIBIÓ: ");
+    Serial.println(mensajeRecibido);
+    Serial.println("----------------------------------------\n");
+  }
+}
+
+//-----------------------------------------------------------------------------------------------//
+//---------------------PRIMER MODELO PARA VERIFICAR CONEXIÓN CON LOS MODULOS---------------------//
+//-----------------------------------------------------------------------------------------------//
+
+#include <SPI.h>
+#include <RF24.h>
+
+// --- Configuración Módulo 1 ---
+// NOTA: Se asigna CSN a IO22 para evitar el conflicto con CE (IO23)
+#define MOD1_CE     23
+#define MOD1_CSN    22   // Cambiar si usas otro pin dedicado para CSN
+#define MOD1_SCK    21
+#define MOD1_MOSI   19
+#define MOD1_MISO   18
+#define MOD1_ENABLE 4
+
+// --- Configuración Módulo 2 ---
+#define MOD2_CE     25
+#define MOD2_CSN    26
+#define MOD2_SCK    14
+#define MOD2_MOSI   12
+#define MOD2_MISO   13
+#define MOD2_ENABLE 32
+
+// Creamos dos instancias de SPI independientes
+SPIClass hspi(HSPI); // Usado para Módulo 1 (Pines por defecto/VSPI o asignados)
+SPIClass vspi(VSPI); // Usado para Módulo 2 (HSPI del ESP32)
+
+// Instancias de RF24 indicando pines (CE, CSN)
+RF24 radio1(MOD1_CE, MOD1_CSN);
+RF24 radio2(MOD2_CE, MOD2_CSN);
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+
+  Serial.println("\n--- Iniciando prueba de comunicación nRF24L01+ ---");
+
+  // Configurar e energizar los pines ENABLE (Activo en ALTO)
+  pinMode(MOD1_ENABLE, OUTPUT);
+  pinMode(MOD2_ENABLE, OUTPUT);
+  
+  digitalWrite(MOD1_ENABLE, HIGH);
+  digitalWrite(MOD2_ENABLE, HIGH);
+  
+  // Tiempo de estabilización tras encender la alimentación de los módulos
+  delay(100);
+
+  // Inicializar buses SPI con sus respectivos pines (SCK, MISO, MOSI, SS)
+  hspi.begin(MOD1_SCK, MOD1_MISO, MOD1_MOSI, MOD1_CSN);
+  vspi.begin(MOD2_SCK, MOD2_MISO, MOD2_MOSI, MOD2_CSN);
+
+  // Probar Módulo 1
+  Serial.println("\n[Verificando Módulo 1...]");
+  if (radio1.begin(&hspi)) {
+    Serial.println("-> Módulo 1 detectado correctamente en el bus SPI.");
+    if (radio1.isChipConnected()) {
+      Serial.println("-> Conexión física y registros del Módulo 1 verificados.");
+      radio1.printDetails(); // Imprime la configuración de los registros en Serial
+    } else {
+      Serial.println("-> ERROR: Módulo 1 respondió en SPI pero fallo en la prueba de registros.");
+    }
+  } else {
+    Serial.println("-> ERROR: No se pudo detectar el Módulo 1. Revisa conexiones, alim. o el pin CSN.");
+  }
+
+  // Probar Módulo 2
+  Serial.println("\n[Verificando Módulo 2...]");
+  if (radio2.begin(&vspi)) {
+    Serial.println("-> Módulo 2 detectado correctamente en el bus SPI.");
+    if (radio2.isChipConnected()) {
+      Serial.println("-> Conexión física y registros del Módulo 2 verificados.");
+      radio2.printDetails();
+    } else {
+      Serial.println("-> ERROR: Módulo 2 respondió en SPI pero fallo en la prueba de registros.");
+    }
+  } else {
+    Serial.println("-> ERROR: No se pudo detectar el Módulo 2. Revisa conexiones o alimentación.");
+  }
+}
+
+void loop() {
+  // Polling continuo del estado del hardware cada 3 segundos
+  Serial.println("\n--- [Polling de Estado] ---");
+  
+  bool mod1_ok = radio1.isChipConnected();
+  bool mod2_ok = radio2.isChipConnected();
+
+  Serial.print("Estado Módulo 1: ");
+  Serial.println(mod1_ok ? "ONLINE (OK)" : "OFFLINE (ERROR)");
+
+  Serial.print("Estado Módulo 2: ");
+  Serial.println(mod2_ok ? "ONLINE (OK)" : "OFFLINE (ERROR)");
+
+  delay(3000);
+}
+
