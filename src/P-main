@@ -1,7 +1,507 @@
 //------------------------------------------------------------------------------------------------//
-//-------------------------- ------------------------//
+//---------------------DECIMO SEGUNDO-------------------//
 //------------------------------------------------------------------------------------------------//
 
+//------------------------------------------------------------------------------------------------//
+//---------------------DECIMO PRIMERO MODELO ANALIZADOR / JAM NO FUCNINA NADA N-------------------//
+//------------------------------------------------------------------------------------------------//
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <SPI.h>
+#include <RF24.h>
+
+// --- Configuración LCD ---
+#define LCD_ADDR 0x27
+#define LCD_COLS 16
+#define LCD_ROWS 2
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
+
+// --- Configuración Módulo nRF24L01+ 1 (HSPI) ---
+#define MOD1_CE 23
+#define MOD1_CSN 22
+#define MOD1_SCK 21
+#define MOD1_MOSI 19
+#define MOD1_MISO 18
+#define MOD1_ENABLE 4
+
+// --- Configuración Módulo nRF24L01+ 2 (VSPI) ---
+#define MOD2_CE 25
+#define MOD2_CSN 26
+#define MOD2_SCK 14
+#define MOD2_MOSI 12
+#define MOD2_MISO 13
+#define MOD2_ENABLE 32
+
+SPIClass hspi(HSPI);
+SPIClass vspi(VSPI);
+
+RF24 radio1(MOD1_CE, MOD1_CSN);
+RF24 radio2(MOD2_CE, MOD2_CSN);
+
+// Paquete de datos basura de 32 bytes
+byte datosBasura[32];
+
+// Canal nRF objetivo (por defecto iniciamos en el canal equivalente al Wi-Fi Ch 6 -> Canal 37)
+uint8_t targetNrfChannel = 37;
+unsigned long ultimoEscaneo = 0;
+const unsigned long intervaloEscaneo = 1000; // Re-escanea el entorno WiFi cada 15 segundos
+
+void mostrar(String linea1, String linea2)
+{
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(linea1.substring(0, LCD_COLS));
+  lcd.setCursor(0, 1);
+  lcd.print(linea2.substring(0, LCD_COLS));
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  while (!Serial)
+    delay(10);
+
+  Wire.begin(2, 15);
+  lcd.init();
+  lcd.backlight();
+  mostrar("Iniciando...", "Rastreador WiFi");
+
+  pinMode(MOD1_ENABLE, OUTPUT);
+  pinMode(MOD2_ENABLE, OUTPUT);
+  digitalWrite(MOD1_ENABLE, HIGH);
+  digitalWrite(MOD2_ENABLE, HIGH);
+  delay(15);
+
+  hspi.begin(MOD1_SCK, MOD1_MISO, MOD1_MOSI, MOD1_CSN);
+  vspi.begin(MOD2_SCK, MOD2_MISO, MOD2_MOSI, MOD2_CSN);
+
+  if (!radio1.begin(&hspi) || !radio2.begin(&vspi))
+  {
+    Serial.println("Error crítico inicializando radios.");
+    mostrar("ERROR", "Radios nRF fallaron");
+    while (1)
+      ;
+  }
+
+  // Configuración de máxima potencia y velocidad para ambos radios
+  radio1.setPALevel(RF24_PA_MAX);
+  radio1.setDataRate(RF24_2MBPS);
+  radio1.setAutoAck(false);
+  radio1.stopListening();
+
+  radio2.setPALevel(RF24_PA_MAX);
+  radio2.setDataRate(RF24_2MBPS);
+  radio2.setAutoAck(false);
+  radio2.stopListening();
+
+  // Rellenar buffer con datos aleatorios
+  for (int i = 0; i < 32; i++)
+  {
+    datosBasura[i] = random(0, 255);
+  }
+
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  delay(1);
+}
+
+void actualizarCanalObjetivo()
+{
+  mostrar("Escaneando WiFi...", "Buscando trafico");
+
+  // Escaneo bloqueante de redes visibles y ocultas
+  int cantidad = WiFi.scanNetworks(false, true, false, 400);
+
+  if (cantidad > 0)
+  {
+    int conteo[14] = {0};
+
+    for (int i = 0; i < cantidad; i++)
+    {
+      int canal = WiFi.channel(i);
+      if (canal >= 1 && canal <= 13)
+      {
+        conteo[canal]++;
+      }
+    }
+
+    // Evaluar carga considerando solapamiento de canales
+    int mejorWifiChannel = 1;
+    int mayorCarga = -1;
+
+    for (int c = 1; c <= 13; c++)
+    {
+      int cargaCanal = 0;
+      for (int j = c - 4; j <= c + 4; j++)
+      {
+        if (j >= 1 && j <= 13)
+        {
+          cargaCanal += conteo[j];
+        }
+      }
+      if (cargaCanal > mayorCarga)
+      {
+        mayorCarga = cargaCanal;
+        mejorWifiChannel = c;
+      }
+    }
+
+    // Convertir el canal Wi-Fi más congestionado al equivalente en nRF24
+    targetNrfChannel = 7 + (5 * mejorWifiChannel);
+    if (targetNrfChannel > 83)
+      targetNrfChannel = 83;
+
+    // Mostrar en LCD el resultado y el canal nRF que se va a seguir
+    char l1[17], l2[17];
+    snprintf(l1, sizeof(l1), "WiFi Ch%d (Carga:%d)", mejorWifiChannel, mayorCarga);
+    snprintf(l2, sizeof(l2), "Siguiendo -> Ch%d", targetNrfChannel);
+    mostrar(String(l1), String(l2));
+    delay(2);
+  }
+  else
+  {
+    mostrar("Sin redes WiFi", "Manteniendo canal");
+    delay(1);
+  }
+
+  WiFi.scanDelete(); // Liberar memoria del escaneo
+}
+
+void loop()
+{
+  // Verificar si es momento de volver a escanear el entorno WiFi para actualizar el objetivo
+  if (millis() - ultimoEscaneo > intervaloEscaneo || ultimoEscaneo == 0)
+  {
+    actualizarCanalObjetivo();
+    ultimoEscaneo = millis();
+  }
+
+  // Mantener ambos radios sintonizados en el canal dinámico calculado
+  radio1.setChannel(targetNrfChannel);
+  radio2.setChannel(targetNrfChannel);
+
+  // Transmisión continua de paquetes en el canal activo
+  radio1.write(&datosBasura, sizeof(datosBasura), true);
+  radio2.write(&datosBasura, sizeof(datosBasura), true);
+}
+
+//------------------------------------------------------------------------------------------------//
+//---------------------DECIMO MODELO PEAK ANALIZADOR DE FRENCUENCIA 2.4 (C/LCD)-------------------//
+//------------------------------------------------------------------------------------------------//
+
+#include <Arduino.h>           // Librería base de Arduino
+#include <WiFi.h>              // Módulo WiFi del ESP32
+#include <Wire.h>              // Comunicación I2C
+#include <LiquidCrystal_I2C.h> // Control del LCD por I2C
+
+#define LCD_ADDR 0x27 // Dirección I2C del LCD (si no anda, probá 0x3F)
+#define LCD_COLS 16   // Columnas del LCD
+#define LCD_ROWS 2    // Filas del LCD
+
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS); // Crea el objeto del LCD
+
+// Función auxiliar: borra la pantalla y escribe dos líneas
+void mostrar(String linea1, String linea2)
+{
+  lcd.clear();                              // Borra todo el LCD
+  lcd.setCursor(0, 0);                      // Cursor en columna 0, fila 0
+  lcd.print(linea1.substring(0, LCD_COLS)); // Escribe la línea 1 (recortada al ancho del LCD)
+  lcd.setCursor(0, 1);                      // Cursor en columna 0, fila 1
+  lcd.print(linea2.substring(0, LCD_COLS)); // Escribe la línea 2 (recortada)
+}
+
+void setup()
+{
+  Wire.begin(21, 22);                 // Inicia I2C con SDA = GPIO21 y SCL = GPIO22
+  lcd.init();                         // Inicializa el LCD
+  lcd.backlight();                    // Enciende la luz de fondo
+  mostrar("Escaner WiFi", "2.4 GHz"); // Mensaje de arranque
+
+  WiFi.persistent(false);      // No guarda la config WiFi en flash
+  WiFi.mode(WIFI_OFF);         // Apaga el WiFi para reiniciar el módulo
+  delay(500);                  // Pausa para que se apague bien
+  WiFi.mode(WIFI_STA);         // Modo estación (necesario para escanear)
+  WiFi.disconnect(true, true); // Se desconecta y borra credenciales
+  delay(1000);                 // Deja que la radio se estabilice
+}
+
+void loop()
+{
+  mostrar("Escaneando...", ""); // Avisa que está escaneando
+
+  // false = bloqueante, true = incluye ocultas, false = activo, 500 ms por canal
+  int cantidad = WiFi.scanNetworks(false, true, false, 500);
+
+  if (cantidad == WIFI_SCAN_FAILED)
+  { // -2: el escaneo falló
+    mostrar("ERROR", "Escaneo fallo");
+    delay(3000);
+  }
+  else if (cantidad == 0)
+  { // 0: sin redes
+    mostrar("Sin redes", "encontradas");
+    delay(3000);
+  }
+  else
+  {                       // Hay redes
+    int conteo[14] = {0}; // Redes por canal (índices 1 a 13)
+
+    mostrar("Redes halladas:", String(cantidad)); // Muestra el total
+    delay(2000);                                  // Lo deja 2 segundos
+
+    for (int i = 0; i < cantidad; i++)
+    {                              // Recorre cada red
+      int canal = WiFi.channel(i); // Canal de la red i
+      int rssi = WiFi.RSSI(i);     // Intensidad de señal
+      if (canal >= 1 && canal <= 13)
+        conteo[canal]++; // Suma al conteo del canal
+
+      String ssid = WiFi.SSID(i); // Nombre de la red
+      if (ssid.length() == 0)
+        ssid = "(oculta)"; // Si es oculta, avisa
+
+      char linea2[17];                                               // Buffer para la segunda línea
+      snprintf(linea2, sizeof(linea2), "Ch%2d %4ddBm", canal, rssi); // Ej: "Ch10  -95dBm"
+
+      char linea1[17];                                                             // Buffer para la primera línea
+      snprintf(linea1, sizeof(linea1), "%d/%d %s", i + 1, cantidad, ssid.c_str()); // Ej: "1/3 CLAROWIFI"
+
+      mostrar(String(linea1), String(linea2)); // Muestra la red en el LCD
+      delay(2500);                             // La deja 2,5 segundos
+    }
+
+    // ---------- Recomendación entre 1, 6 y 11 ----------
+    int candidatos[3] = {1, 6, 11}; // Canales que no se solapan
+    int carga[3];                   // Carga estimada de cada uno
+    int mejorCanal = 1;             // Canal recomendado
+    int menorCarga = 9999;          // Menor carga encontrada
+
+    for (int n = 0; n < 3; n++)
+    { // Evalúa cada candidato
+      int c = candidatos[n];
+      carga[n] = 0;
+      for (int j = c - 4; j <= c + 4; j++)
+      { // Suma redes en canales vecinos (se solapan)
+        if (j >= 1 && j <= 13)
+          carga[n] += conteo[j];
+      }
+      if (carga[n] < menorCarga)
+      { // Si es la menor hasta ahora...
+        menorCarga = carga[n];
+        mejorCanal = c; // ...la guarda como recomendada
+      }
+    }
+
+    char l1[17];
+    snprintf(l1, sizeof(l1), "Carga 1/6/11:"); // Título de la pantalla de resumen
+    char l2[17];
+    snprintf(l2, sizeof(l2), "%d / %d / %d", carga[0], carga[1], carga[2]); // Ej: "3 / 1 / 0"
+    mostrar(String(l1), String(l2));
+    delay(3000);
+
+    char l3[17];
+    snprintf(l3, sizeof(l3), "Usa el canal %d", mejorCanal); // Recomendación final
+    mostrar("Mejor canal:", String(l3));
+    delay(3000);
+  }
+
+  WiFi.scanDelete(); // Libera la memoria del escaneo
+}
+
+//------------------------------------------------------------------------------------------------//
+//-------------------------NOVENO MODELO ANTES DEL ANALIZADOR DE WIFI (JAM)-----------------------//
+//------------------------------------------------------------------------------------------------//
+
+#include <SPI.h>
+#include <RF24.h>
+
+// --- Configuración Módulo 1 ---
+#define MOD1_CE 23
+#define MOD1_CSN 22
+#define MOD1_SCK 21
+#define MOD1_MOSI 19
+#define MOD1_MISO 18
+#define MOD1_ENABLE 4
+
+// --- Configuración Módulo 2 ---
+#define MOD2_CE 25
+#define MOD2_CSN 26
+#define MOD2_SCK 14
+#define MOD2_MOSI 12
+#define MOD2_MISO 13
+#define MOD2_ENABLE 32
+
+SPIClass hspi(HSPI);
+SPIClass vspi(VSPI);
+
+RF24 radio1(MOD1_CE, MOD1_CSN);
+RF24 radio2(MOD2_CE, MOD2_CSN);
+
+// Paquete de datos basura de 32 bytes
+byte datosBasura[32];
+
+// Variables para el barrido acotado (Canal 0 al 83)
+uint8_t canal1 = 0;  // Inicia en 2400 MHz (Canal 0)
+uint8_t canal2 = 41; // Inicia a mitad del rango (Canal 41 = 2441 MHz)
+
+void setup()
+{
+  Serial.begin(115200);
+  while (!Serial)
+    delay(10);
+
+  Serial.println("\n--- Iniciando Barrido Restringido (2.400 - 2.4835 GHz) ---");
+
+  pinMode(MOD1_ENABLE, OUTPUT);
+  pinMode(MOD2_ENABLE, OUTPUT);
+  digitalWrite(MOD1_ENABLE, HIGH);
+  digitalWrite(MOD2_ENABLE, HIGH);
+  delay(150);
+
+  hspi.begin(MOD1_SCK, MOD1_MISO, MOD1_MOSI, MOD1_CSN);
+  vspi.begin(MOD2_SCK, MOD2_MISO, MOD2_MOSI, MOD2_CSN);
+
+  if (!radio1.begin(&hspi) || !radio2.begin(&vspi))
+  {
+    Serial.println("Error crítico inicializando radios.");
+    while (1)
+      ;
+  }
+
+  // Configuración de máxima potencia y velocidad
+  radio1.setPALevel(RF24_PA_MAX);
+  radio1.setDataRate(RF24_2MBPS);
+  radio1.setAutoAck(false);
+  radio1.stopListening();
+
+  radio2.setPALevel(RF24_PA_MAX);
+  radio2.setDataRate(RF24_2MBPS);
+  radio2.setAutoAck(false);
+  radio2.stopListening();
+
+  // Rellenar buffer con datos aleatorios
+  for (int i = 0; i < 32; i++)
+  {
+    datosBasura[i] = random(0, 255);
+  }
+}
+
+void loop()
+{
+  // Aplicar canales actuales
+  radio1.setChannel(canal1);
+  radio2.setChannel(canal2);
+
+  // Ráfaga rápida en la frecuencia seleccionada
+  // unsigned long inicio = millis();
+  // while (millis() - inicio < 50)
+  // {
+  radio1.write(&datosBasura, sizeof(datosBasura), true);
+  radio2.write(&datosBasura, sizeof(datosBasura), true);
+  // }
+
+  // Incrementar secuencialmente y resetear al llegar al canal 83 (2.4835 GHz)
+  canal1++;
+  if (canal1 > 83)
+  {
+    canal1 = 0; // Vuelve a 2400 MHz
+  }
+
+  canal2++;
+  if (canal2 > 83)
+  {
+    canal2 = 0; // Vuelve a 2400 MHz
+  }
+}
+
+//------------------------------------------------------------------------------------------------//
+//-------------------------OCTAVO MODELO LECTOR DEL ESPECTRO FRECUENCIA 2.4-----------------------//
+//------------------------------------------------------------------------------------------------//
+
+#include "WiFi.h"
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  // Configurar el ESP32 en modo estación (STA) y desconectar por seguridad
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+
+  Serial.println("\n--- Analizador Wi-Fi ESP32 Iniciado ---");
+}
+
+void loop()
+{
+  Serial.println("\nEscaneando el espectro Wi-Fi (2.4 GHz)...");
+
+  // Iniciar escaneo de redes (true = escaneo asíncrono/bloqueante, busca todas las redes)
+  int n = WiFi.scanNetworks();
+
+  if (n == 0)
+  {
+    Serial.println("No se encontraron redes Wi-Fi cercanas.");
+  }
+  else
+  {
+    Serial.print("¡Se encontraron ");
+    Serial.print(n);
+    Serial.println(" redes Wi-Fi!");
+    Serial.println("------------------------------------------------------------------");
+    Serial.println("Nº | SSID (Nombre de Red)      | RSSI (dBm) | Canal | BSSID (MAC)");
+    Serial.println("------------------------------------------------------------------");
+
+    for (int i = 0; i < n; ++i)
+    {
+      // Imprimir número
+      Serial.print(i + 1 < 10 ? " " : "");
+      Serial.print(i + 1);
+      Serial.print(" | ");
+
+      // Imprimir SSID (con formato fijo para alinear)
+      String ssid = WiFi.SSID(i);
+      if (ssid.length() == 0)
+        ssid = "<Oculta>";
+      Serial.print(ssid);
+      for (int j = ssid.length(); j < 25; j++)
+        Serial.print(" ");
+      Serial.print("| ");
+
+      // Imprimir RSSI (Potencia de señal)
+      int rssi = WiFi.RSSI(i);
+      Serial.print(rssi);
+      if (rssi > -60)
+        Serial.print(" (Excelente) ");
+      else if (rssi > -80)
+        Serial.print(" (Buena)     ");
+      else
+        Serial.print(" (Débil)     ");
+      Serial.print("| ");
+
+      // Imprimir Canal Wi-Fi (1 al 13)
+      int canal = WiFi.channel(i);
+      if (canal < 10)
+        Serial.print(" ");
+      Serial.print(canal);
+      Serial.print("   | ");
+
+      // Imprimir dirección MAC del router
+      Serial.println(WiFi.BSSIDstr(i));
+    }
+    Serial.println("------------------------------------------------------------------");
+  }
+
+  // Limpiar los resultados del escaneo para liberar memoria
+  WiFi.scanDelete();
+
+  // Esperar 5 segundos antes de volver a escanear
+  delay(5000);
+}
 
 //------------------------------------------------------------------------------------------------//
 //-------------------------SEPTIMO MODELO PARA TRANSMITIR RUIDO LOS MODULOS-----------------------//
@@ -11,19 +511,19 @@
 #include <RF24.h>
 
 // --- Configuración Módulo 1 ---
-#define MOD1_CE     23
-#define MOD1_CSN    22
-#define MOD1_SCK    21
-#define MOD1_MOSI   19
-#define MOD1_MISO   18
+#define MOD1_CE 23
+#define MOD1_CSN 22
+#define MOD1_SCK 21
+#define MOD1_MOSI 19
+#define MOD1_MISO 18
 #define MOD1_ENABLE 4
 
 // --- Configuración Módulo 2 ---
-#define MOD2_CE     25
-#define MOD2_CSN    26
-#define MOD2_SCK    14
-#define MOD2_MOSI   12
-#define MOD2_MISO   13
+#define MOD2_CE 25
+#define MOD2_CSN 26
+#define MOD2_SCK 14
+#define MOD2_MOSI 12
+#define MOD2_MISO 13
 #define MOD2_ENABLE 32
 
 SPIClass hspi(HSPI);
@@ -35,9 +535,11 @@ RF24 radio2(MOD2_CE, MOD2_CSN);
 // Paquete de datos basura de 32 bytes (el máximo permitido por el nRF24)
 byte datosBasura[32];
 
-void setup() {
+void setup()
+{
   Serial.begin(115200);
-  while (!Serial) delay(10);
+  while (!Serial)
+    delay(10);
 
   Serial.println("\n--- Iniciando Modo de Saturación RF Agresiva ---");
 
@@ -50,9 +552,11 @@ void setup() {
   hspi.begin(MOD1_SCK, MOD1_MISO, MOD1_MOSI, MOD1_CSN);
   vspi.begin(MOD2_SCK, MOD2_MISO, MOD2_MOSI, MOD2_CSN);
 
-  if (!radio1.begin(&hspi) || !radio2.begin(&vspi)) {
+  if (!radio1.begin(&hspi) || !radio2.begin(&vspi))
+  {
     Serial.println("Error crítico inicializando radios.");
-    while (1);
+    while (1)
+      ;
   }
 
   // Configuración de máxima potencia y máxima agresividad de transmisión
@@ -67,12 +571,14 @@ void setup() {
   radio2.stopListening();
 
   // Rellenar el buffer con datos aleatorios
-  for (int i = 0; i < 32; i++) {
+  for (int i = 0; i < 32; i++)
+  {
     datosBasura[i] = random(0, 255);
   }
 }
 
-void loop() {
+void loop()
+{
   // Elegir canales de forma aleatoria o secuencial muy rápida dentro de la zona Wi-Fi (ej: canales 1 al 13 del nRF equivalen aprox a canales Wi-Fi)
   uint8_t canal1 = random(0, 80);
   uint8_t canal2 = random(81, 125);
@@ -83,7 +589,8 @@ void loop() {
   // Inyectar paquetes de forma masiva sin respirar en este canal
   // Esto genera un "muro de ruido" de datos digitales en esa frecuencia
   unsigned long inicio = millis();
-  while (millis() - inicio < 50) { // Pasa 50 milisegundos escupiéndo paquetes en estos canales
+  while (millis() - inicio < 50)
+  {                                                        // Pasa 50 milisegundos escupiéndo paquetes en estos canales
     radio1.write(&datosBasura, sizeof(datosBasura), true); // true = no esperar ACK
     radio2.write(&datosBasura, sizeof(datosBasura), true);
   }
@@ -96,19 +603,19 @@ void loop() {
 #include <RF24.h>
 
 // --- Configuración Módulo 1 ---
-#define MOD1_CE     23
-#define MOD1_CSN    22
-#define MOD1_SCK    21
-#define MOD1_MOSI   19
-#define MOD1_MISO   18
+#define MOD1_CE 23
+#define MOD1_CSN 22
+#define MOD1_SCK 21
+#define MOD1_MOSI 19
+#define MOD1_MISO 18
 #define MOD1_ENABLE 4
 
 // --- Configuración Módulo 2 ---
-#define MOD2_CE     25
-#define MOD2_CSN    26
-#define MOD2_SCK    14
-#define MOD2_MOSI   12
-#define MOD2_MISO   13
+#define MOD2_CE 25
+#define MOD2_CSN 26
+#define MOD2_SCK 14
+#define MOD2_MOSI 12
+#define MOD2_MISO 13
 #define MOD2_ENABLE 32
 
 SPIClass hspi(HSPI);
@@ -119,15 +626,17 @@ RF24 radio2(MOD2_CE, MOD2_CSN);
 
 // Temporizador para 1 segundo (1000 milisegundos)
 unsigned long ultimoCambio = 0;
-const unsigned long intervaloCanal = 1000; 
+const unsigned long intervaloCanal = 1000;
 
 // Canales iniciales de trabajo (El nRF24L01 soporta del canal 0 al 125)
 uint8_t canalMod1 = 10; // Empieza en 2410 MHz
 uint8_t canalMod2 = 70; // Empieza en 2470 MHz
 
-void setup() {
+void setup()
+{
   Serial.begin(115200);
-  while (!Serial) delay(10);
+  while (!Serial)
+    delay(10);
 
   Serial.println("\n--- Iniciando Portadora Continua (Salto de 1s) ---");
 
@@ -143,9 +652,11 @@ void setup() {
   vspi.begin(MOD2_SCK, MOD2_MISO, MOD2_MOSI, MOD2_CSN);
 
   // Inicializar radios
-  if (!radio1.begin(&hspi) || !radio2.begin(&vspi)) {
+  if (!radio1.begin(&hspi) || !radio2.begin(&vspi))
+  {
     Serial.println("Error crítico al inicializar los radios.");
-    while (1);
+    while (1)
+      ;
   }
 
   // Iniciar la portadora continua en ambos módulos a la potencia máxima (PA_MAX)
@@ -153,30 +664,34 @@ void setup() {
   radio2.startConstCarrier(RF24_PA_MAX, canalMod2);
 
   Serial.println("¡Portadoras continuas activas!");
-  
+
   ultimoCambio = millis();
 }
 
-void loop() {
+void loop()
+{
   unsigned long tiempoActual = millis();
 
   // Verificar si ya pasó 1 segundo
-  if (tiempoActual - ultimoCambio >= intervaloCanal) {
+  if (tiempoActual - ultimoCambio >= intervaloCanal)
+  {
     ultimoCambio = tiempoActual;
 
     // Avanzar de 1 en 1 canal
     canalMod1++;
-    if (canalMod1 > 125) canalMod1 = 0; // El límite superior del nRF24 es el canal 125
+    if (canalMod1 > 125)
+      canalMod1 = 0; // El límite superior del nRF24 es el canal 125
 
     canalMod2++;
-    if (canalMod2 > 125) canalMod2 = 0;
+    if (canalMod2 > 125)
+      canalMod2 = 0;
 
     // Aplicar los nuevos canales manteniendo la portadora continua
     radio1.startConstCarrier(RF24_PA_MAX, canalMod1);
     radio2.startConstCarrier(RF24_PA_MAX, canalMod2);
 
     // Imprimir estado actual
-    Serial.print("M1 Canal: "); 
+    Serial.print("M1 Canal: ");
     Serial.print(canalMod1);
     Serial.print(" (");
     Serial.print(2400 + canalMod1);
@@ -196,19 +711,19 @@ void loop() {
 #include <RF24.h>
 
 // --- Configuración Módulo 1 ---
-#define MOD1_CE     23
-#define MOD1_CSN    22
-#define MOD1_SCK    21
-#define MOD1_MOSI   19
-#define MOD1_MISO   18
+#define MOD1_CE 23
+#define MOD1_CSN 22
+#define MOD1_SCK 21
+#define MOD1_MOSI 19
+#define MOD1_MISO 18
 #define MOD1_ENABLE 4
 
 // --- Configuración Módulo 2 ---
-#define MOD2_CE     25
-#define MOD2_CSN    26
-#define MOD2_SCK    14
-#define MOD2_MOSI   12
-#define MOD2_MISO   13
+#define MOD2_CE 25
+#define MOD2_CSN 26
+#define MOD2_SCK 14
+#define MOD2_MOSI 12
+#define MOD2_MISO 13
 #define MOD2_ENABLE 32
 
 SPIClass hspi(HSPI);
@@ -219,15 +734,17 @@ RF24 radio2(MOD2_CE, MOD2_CSN);
 
 // Temporizador para los 60 segundos (60000 milisegundos)
 unsigned long ultimoCambio = 0;
-const unsigned long intervaloCanal = 60000; 
+const unsigned long intervaloCanal = 60000;
 
 // Canales iniciales de trabajo (El nRF24L01 soporta del canal 0 al 125, equivalentes a 2.400 GHz a 2.525 GHz)
 uint8_t canalMod1 = 10; // Empieza en 2410 MHz
 uint8_t canalMod2 = 70; // Empieza en 2470 MHz
 
-void setup() {
+void setup()
+{
   Serial.begin(115200);
-  while (!Serial) delay(10);
+  while (!Serial)
+    delay(10);
 
   Serial.println("\n--- Iniciando Generador de Portadora Continua ---");
 
@@ -243,9 +760,11 @@ void setup() {
   vspi.begin(MOD2_SCK, MOD2_MISO, MOD2_MOSI, MOD2_CSN);
 
   // Inicializar radios
-  if (!radio1.begin(&hspi) || !radio2.begin(&vspi)) {
+  if (!radio1.begin(&hspi) || !radio2.begin(&vspi))
+  {
     Serial.println("Error crítico al inicializar los radios.");
-    while (1);
+    while (1)
+      ;
   }
 
   // Iniciar la portadora continua en ambos módulos a la potencia máxima (PA_MAX)
@@ -254,33 +773,41 @@ void setup() {
   radio2.startConstCarrier(RF24_PA_MAX, canalMod2);
 
   Serial.println("¡Portadoras continuas activas!");
-  Serial.print("Módulo 1 emitiendo en Canal: "); Serial.println(canalMod1);
-  Serial.print("Módulo 2 emitiendo en Canal: "); Serial.println(canalMod2);
-  
+  Serial.print("Módulo 1 emitiendo en Canal: ");
+  Serial.println(canalMod1);
+  Serial.print("Módulo 2 emitiendo en Canal: ");
+  Serial.println(canalMod2);
+
   ultimoCambio = millis();
 }
 
-void loop() {
+void loop()
+{
   unsigned long tiempoActual = millis();
 
   // Verificar si ya pasaron 60 segundos
-  if (tiempoActual - ultimoCambio >= intervaloCanal) {
+  if (tiempoActual - ultimoCambio >= intervaloCanal)
+  {
     ultimoCambio = tiempoActual;
 
     // Cambiar de canal de forma cíclica (avanzamos 10 canales, con tope de 120)
     canalMod1 += 10;
-    if (canalMod1 > 120) canalMod1 = 10;
+    if (canalMod1 > 120)
+      canalMod1 = 10;
 
     canalMod2 += 10;
-    if (canalMod2 > 120) canalMod2 = 20;
+    if (canalMod2 > 120)
+      canalMod2 = 20;
 
     // Aplicar los nuevos canales manteniendo la portadora continua
     radio1.startConstCarrier(RF24_PA_MAX, canalMod1);
     radio2.startConstCarrier(RF24_PA_MAX, canalMod2);
 
     Serial.println("\n--- [SALTO DE CANAL - 60s] ---");
-    Serial.print("Módulo 1 -> Nuevo canal: "); Serial.println(canalMod1);
-    Serial.print("Módulo 2 -> Nuevo canal: "); Serial.println(canalMod2);
+    Serial.print("Módulo 1 -> Nuevo canal: ");
+    Serial.println(canalMod1);
+    Serial.print("Módulo 2 -> Nuevo canal: ");
+    Serial.println(canalMod2);
   }
 }
 
@@ -292,19 +819,19 @@ void loop() {
 #include <RF24.h>
 
 // --- Configuración Módulo 1 ---
-#define MOD1_CE     23
-#define MOD1_CSN    22
-#define MOD1_SCK    21
-#define MOD1_MOSI   19
-#define MOD1_MISO   18
+#define MOD1_CE 23
+#define MOD1_CSN 22
+#define MOD1_SCK 21
+#define MOD1_MOSI 19
+#define MOD1_MISO 18
 #define MOD1_ENABLE 4
 
 // --- Configuración Módulo 2 ---
-#define MOD2_CE     25
-#define MOD2_CSN    26
-#define MOD2_SCK    14
-#define MOD2_MOSI   12
-#define MOD2_MISO   13
+#define MOD2_CE 25
+#define MOD2_CSN 26
+#define MOD2_SCK 14
+#define MOD2_MOSI 12
+#define MOD2_MISO 13
 #define MOD2_ENABLE 32
 
 SPIClass hspi(HSPI);
@@ -316,9 +843,11 @@ RF24 radio2(MOD2_CE, MOD2_CSN);
 // Dirección común para un receptor externo, o direcciones separadas
 const byte direccionReceptor[6] = "ExtRx";
 
-void setup() {
+void setup()
+{
   Serial.begin(115200);
-  while (!Serial) delay(10);
+  while (!Serial)
+    delay(10);
 
   Serial.println("\n--- Iniciando Transmisores Dobles con Antena ---");
 
@@ -333,19 +862,21 @@ void setup() {
   hspi.begin(MOD1_SCK, MOD1_MISO, MOD1_MOSI, MOD1_CSN);
   vspi.begin(MOD2_SCK, MOD2_MISO, MOD2_MOSI, MOD2_CSN);
 
-  if (!radio1.begin(&hspi) || !radio2.begin(&vspi)) {
+  if (!radio1.begin(&hspi) || !radio2.begin(&vspi))
+  {
     Serial.println("Error al inicializar los radios.");
-    while (1);
+    while (1)
+      ;
   }
 
   // Configuración de RF para alta potencia y largo alcance
   radio1.setChannel(76);
-  radio1.setDataRate(RF24_250KBPS);     // 250kbps da mayor alcance y sensibilidad
-  radio1.setPALevel(RF24_PA_MAX);       // Potencia máxima (¡con antenas puestas!)
+  radio1.setDataRate(RF24_250KBPS); // 250kbps da mayor alcance y sensibilidad
+  radio1.setPALevel(RF24_PA_MAX);   // Potencia máxima (¡con antenas puestas!)
   radio1.openWritingPipe(direccionReceptor);
   radio1.stopListening();
 
-  radio2.setChannel(80);                // Canal diferente para el módulo 2
+  radio2.setChannel(80); // Canal diferente para el módulo 2
   radio2.setDataRate(RF24_250KBPS);
   radio2.setPALevel(RF24_PA_MAX);
   radio2.openWritingPipe(direccionReceptor);
@@ -354,7 +885,8 @@ void setup() {
   Serial.println("¡Módulos listos y transmitiendo hacia el exterior!");
 }
 
-void loop() {
+void loop()
+{
   // Transmitir desde Módulo 1
   const char msg1[] = "Paquete desde Modulo 1 (Canal 76)";
   bool ok1 = radio1.write(&msg1, sizeof(msg1));
@@ -381,19 +913,19 @@ void loop() {
 #include <RF24.h>
 
 // --- Configuración Módulo 1 ---
-#define MOD1_CE     23
-#define MOD1_CSN    22
-#define MOD1_SCK    21
-#define MOD1_MOSI   19
-#define MOD1_MISO   18
+#define MOD1_CE 23
+#define MOD1_CSN 22
+#define MOD1_SCK 21
+#define MOD1_MOSI 19
+#define MOD1_MISO 18
 #define MOD1_ENABLE 4
 
 // --- Configuración Módulo 2 ---
-#define MOD2_CE     25
-#define MOD2_CSN    26
-#define MOD2_SCK    14
-#define MOD2_MOSI   12
-#define MOD2_MISO   13
+#define MOD2_CE 25
+#define MOD2_CSN 26
+#define MOD2_SCK 14
+#define MOD2_MOSI 12
+#define MOD2_MISO 13
 #define MOD2_ENABLE 32
 
 SPIClass hspi(HSPI);
@@ -404,15 +936,17 @@ RF24 radio2(MOD2_CE, MOD2_CSN);
 
 // Direcciones de las tuberías (pipes) para comunicación entre ambos
 // Usamos dos direcciones de 5 bytes invertidas para hablar de uno a otro
-const byte direccion[6] = "NodeX"; 
+const byte direccion[6] = "NodeX";
 const byte direccion2[6] = "NodeY";
 
 unsigned long ultimaTransmision = 0;
 const long intervalo = 1000; // Enviar un mensaje cada 1 segundo
 
-void setup() {
+void setup()
+{
   Serial.begin(115200);
-  while (!Serial) delay(10);
+  while (!Serial)
+    delay(10);
 
   Serial.println("\n--- Iniciando prueba de RF Ping-Pong (M1 <-> M2) ---");
 
@@ -428,9 +962,11 @@ void setup() {
   vspi.begin(MOD2_SCK, MOD2_MISO, MOD2_MOSI, MOD2_CSN);
 
   // Inicializar radios
-  if (!radio1.begin(&hspi) || !radio2.begin(&vspi)) {
+  if (!radio1.begin(&hspi) || !radio2.begin(&vspi))
+  {
     Serial.println("Error crítico inicializando los radios.");
-    while (1);
+    while (1)
+      ;
   }
 
   // Configuración de los Canales y Potencia
@@ -456,35 +992,41 @@ void setup() {
   Serial.println("¡Sistemas listos! M1 transmitiendo, M2 escuchando...");
 }
 
-void loop() {
+void loop()
+{
   unsigned long tiempoActual = millis();
 
   // --- 1. BLOQUE DE TRANSMISIÓN (Módulo 1 envía cada 1 segundo) ---
-  if (tiempoActual - ultimaTransmision >= intervalo) {
+  if (tiempoActual - ultimaTransmision >= intervalo)
+  {
     ultimaTransmision = tiempoActual;
 
     const char texto[] = "Hola desde M1!";
     radio1.stopListening(); // Asegurar modo TX
-    
+
     Serial.print("M1 -> Enviando mensaje: ");
     Serial.println(texto);
 
     // Intentar enviar los datos
     bool exito = radio1.write(&texto, sizeof(texto));
 
-    if (exito) {
+    if (exito)
+    {
       Serial.println("M1 -> ¡Mensaje enviado con éxito!");
-    } else {
+    }
+    else
+    {
       Serial.println("M1 -> Falló el envío (No hubo ACK del receptor)");
     }
   }
 
   // --- 2. BLOQUE DE RECEPCIÓN (Módulo 2 escucha si hay datos) ---
   radio2.startListening(); // Asegurar modo RX
-  if (radio2.available()) {
+  if (radio2.available())
+  {
     char mensajeRecibido[32] = "";
     radio2.read(&mensajeRecibido, sizeof(mensajeRecibido));
-    
+
     Serial.print("\n>>> M2 RECIBIÓ: ");
     Serial.println(mensajeRecibido);
     Serial.println("----------------------------------------\n");
@@ -500,19 +1042,19 @@ void loop() {
 
 // --- Configuración Módulo 1 ---
 // NOTA: Se asigna CSN a IO22 para evitar el conflicto con CE (IO23)
-#define MOD1_CE     23
-#define MOD1_CSN    22   // Cambiar si usas otro pin dedicado para CSN
-#define MOD1_SCK    21
-#define MOD1_MOSI   19
-#define MOD1_MISO   18
+#define MOD1_CE 23
+#define MOD1_CSN 22 // Cambiar si usas otro pin dedicado para CSN
+#define MOD1_SCK 21
+#define MOD1_MOSI 19
+#define MOD1_MISO 18
 #define MOD1_ENABLE 4
 
 // --- Configuración Módulo 2 ---
-#define MOD2_CE     25
-#define MOD2_CSN    26
-#define MOD2_SCK    14
-#define MOD2_MOSI   12
-#define MOD2_MISO   13
+#define MOD2_CE 25
+#define MOD2_CSN 26
+#define MOD2_SCK 14
+#define MOD2_MOSI 12
+#define MOD2_MISO 13
 #define MOD2_ENABLE 32
 
 // Creamos dos instancias de SPI independientes
@@ -523,19 +1065,21 @@ SPIClass vspi(VSPI); // Usado para Módulo 2 (HSPI del ESP32)
 RF24 radio1(MOD1_CE, MOD1_CSN);
 RF24 radio2(MOD2_CE, MOD2_CSN);
 
-void setup() {
+void setup()
+{
   Serial.begin(115200);
-  while (!Serial) delay(10);
+  while (!Serial)
+    delay(10);
 
   Serial.println("\n--- Iniciando prueba de comunicación nRF24L01+ ---");
 
   // Configurar e energizar los pines ENABLE (Activo en ALTO)
   pinMode(MOD1_ENABLE, OUTPUT);
   pinMode(MOD2_ENABLE, OUTPUT);
-  
+
   digitalWrite(MOD1_ENABLE, HIGH);
   digitalWrite(MOD2_ENABLE, HIGH);
-  
+
   // Tiempo de estabilización tras encender la alimentación de los módulos
   delay(100);
 
@@ -545,37 +1089,50 @@ void setup() {
 
   // Probar Módulo 1
   Serial.println("\n[Verificando Módulo 1...]");
-  if (radio1.begin(&hspi)) {
+  if (radio1.begin(&hspi))
+  {
     Serial.println("-> Módulo 1 detectado correctamente en el bus SPI.");
-    if (radio1.isChipConnected()) {
+    if (radio1.isChipConnected())
+    {
       Serial.println("-> Conexión física y registros del Módulo 1 verificados.");
       radio1.printDetails(); // Imprime la configuración de los registros en Serial
-    } else {
+    }
+    else
+    {
       Serial.println("-> ERROR: Módulo 1 respondió en SPI pero fallo en la prueba de registros.");
     }
-  } else {
+  }
+  else
+  {
     Serial.println("-> ERROR: No se pudo detectar el Módulo 1. Revisa conexiones, alim. o el pin CSN.");
   }
 
   // Probar Módulo 2
   Serial.println("\n[Verificando Módulo 2...]");
-  if (radio2.begin(&vspi)) {
+  if (radio2.begin(&vspi))
+  {
     Serial.println("-> Módulo 2 detectado correctamente en el bus SPI.");
-    if (radio2.isChipConnected()) {
+    if (radio2.isChipConnected())
+    {
       Serial.println("-> Conexión física y registros del Módulo 2 verificados.");
       radio2.printDetails();
-    } else {
+    }
+    else
+    {
       Serial.println("-> ERROR: Módulo 2 respondió en SPI pero fallo en la prueba de registros.");
     }
-  } else {
+  }
+  else
+  {
     Serial.println("-> ERROR: No se pudo detectar el Módulo 2. Revisa conexiones o alimentación.");
   }
 }
 
-void loop() {
+void loop()
+{
   // Polling continuo del estado del hardware cada 3 segundos
   Serial.println("\n--- [Polling de Estado] ---");
-  
+
   bool mod1_ok = radio1.isChipConnected();
   bool mod2_ok = radio2.isChipConnected();
 
@@ -587,4 +1144,3 @@ void loop() {
 
   delay(3000);
 }
-
