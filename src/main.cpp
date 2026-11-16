@@ -2,10 +2,12 @@
 // #include "I2CRegistros.h"
 // #include "LCD_I2C_Registros.h"
 // #include "Analizador.h"
-#include "V2Analizador.h"
 #include <LiquidCrystal_I2C.h>
 #include <Wire.h>
+#include "timer.h"
+#include "debouncing.h"
 
+#include "V2Analizador.h"
 #include "Regulador.h"
 
 // Pines I2C del LCD (según tu código original: Wire.begin(2, 15))
@@ -23,6 +25,9 @@ LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 // Arduino-ESP32, justamente para poder definirlas desde un .c puro.
 void setup(void)
 {
+    timer_init();
+    debouncing_init();
+
     Wire.begin(PIN_SDA, PIN_SCL); // Inicia I2C con los pines elegidos
     lcd.init();                   // Inicializa el LCD
     lcd.backlight();              // Enciende la luz de fondo
@@ -33,6 +38,19 @@ void setup(void)
 
 void loop(void)
 {
-    v2analizador_loop(); // Escanea, muestra redes y recomienda canal
-    regulador_loop();
+
+    static uint8_t ant = SUELTO;   // estado anterior del botón
+    static uint8_t flag = APAGADO; // 0 = apagada y 1 = prendida
+    int8_t L = estado_botn();
+
+    v2analizador_loop(); // escanea, muestra redes y recomienda canal
+
+    if (ant == APRETADO && L == SUELTO)
+        flag = !flag; // apretó y soltó
+    ant = L;          // graias Wels por:
+
+    if (flag)
+    {
+        regulador_loop();
+    }
 }
