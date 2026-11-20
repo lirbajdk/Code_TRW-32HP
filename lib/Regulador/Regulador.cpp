@@ -17,7 +17,7 @@ RF24 radioVSPI(VSPI_CE, VSPI_CSN, 16000000);
 bool hasHSPI = false;
 bool hasVSPI = false;
 
-byte ch_hspi = 45;
+byte ch_hspi = 45; // caifalcon@hotmail.com
 byte ch_vspi = 45;
 
 unsigned int flag_hspi = 0;

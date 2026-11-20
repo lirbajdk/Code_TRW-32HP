@@ -12,7 +12,8 @@ uint8_t canalx = 0;
 #define T_TOTAL_REDES 700   // pantalla "Redes halladas"
 #define T_POR_RED 1500      // cada red en pantalla
 #define T_RESULTADO 700     // pantallas de carga / mejor canal
-#define T_ERROR 30
+#define T_SIN_REDES 2000    // tiempo visible cuando hay 3 o menos redes
+#define T_ERROR 1500
 
 // ---------- Estados ----------
 enum Estado
@@ -146,10 +147,12 @@ void v2analizador_loop()
             estado = ST_PAUSA_FINAL;
             return;
         }
-        if (n == 0)
+
+        // Si hay 0, 1, 2 o 3 redes (no supera 3 redes)
+        if (n <= 3)
         {
-            mostrar("Sin redes", "encontradas");
-            esperar(T_ERROR);
+            mostrar("No se encontraron", "redes");
+            esperar(T_SIN_REDES);
             estado = ST_PAUSA_FINAL;
             return;
         }

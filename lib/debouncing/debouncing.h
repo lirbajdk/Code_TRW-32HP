@@ -9,7 +9,7 @@
 /***************************************************************************************************
  *  DEFINES Y CONSTANTES
  ***************************************************************************************************/
-#define PIN_BOT1 27
+#define PIN_BOT1 5
 #define BOT1 digitalRead(PIN_BOT1)
 
 #define DEBOUNCING 40 // tiempo de rebote del pulsador

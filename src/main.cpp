@@ -5,11 +5,11 @@
 #include <LiquidCrystal_I2C.h>
 #include <Wire.h>
 #include "timer.h"
-#include "debouncing.h"
+// #include "debouncing.h"
 
 #include "V2Analizador.h"
 #include "Regulador.h"
-
+#define BOTON 5
 // Pines I2C del LCD (según tu código original: Wire.begin(2, 15))
 #define PIN_SDA 33 // SDA = GPIO2
 #define PIN_SCL 27 // SCL = GPIO15
@@ -25,8 +25,10 @@ LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 // Arduino-ESP32, justamente para poder definirlas desde un .c puro.
 void setup(void)
 {
+    pinMode(BOTON, INPUT_PULLUP); // pull-up interno: el botón va entre el pin y GND
+
     timer_init();
-    debouncing_init();
+    // debouncing_init();
 
     Wire.begin(PIN_SDA, PIN_SCL); // Inicia I2C con los pines elegidos
     lcd.init();                   // Inicializa el LCD
@@ -39,17 +41,17 @@ void setup(void)
 void loop(void)
 {
 
-    static uint8_t ant = SUELTO;   // estado anterior del botón
-    static uint8_t flag = APAGADO; // 0 = apagada y 1 = prendida
-    int8_t L = estado_botn();
+    // static uint8_t ant = SUELTO;   // estado anterior del botón
+    // static uint8_t flag = APAGADO; // 0 = apagada y 1 = prendida
+    // int8_t L = estado_botn();
 
     v2analizador_loop(); // escanea, muestra redes y recomienda canal
 
-    if (ant == APRETADO && L == SUELTO)
-        flag = !flag; // apretó y soltó
-    ant = L;          // graias Wels por:
+    // if (ant == APRETADO && L == SUELTO)
+    //     flag = !flag; // apretó y soltó
+    // ant = L;          // graias Wels por:
 
-    if (flag)
+    if (digitalRead(BOTON) == LOW)
     {
         regulador_loop();
     }
